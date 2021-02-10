@@ -1,0 +1,190 @@
+# Workflows are composed of declarative stages for train, test, package, deploy and monitor.
+# Workspaces isolate stage execution, enabling branch-based development
+Workflows:
+  # Deploy every branch to an ephemeral testing deployment.
+  - dev-deploy:
+      trigger:
+        on: "commit"
+        branch: "*"
+        excludeBranches: ["master", "staging"]
+      workspace: $BRANCHNAME
+      # no stages specified, will run train-test-package-deploy.
+
+  - prod:
+      trigger:
+        on: "commit"
+        branch: "master"
+      workspace: production
+      stages:
+        - train
+        - test
+        - package
+        - manual_approval:
+            approvers: team/foobar
+            notification: "email" # PLUGIN: notifications channels
+        - deploy
+
+####### STAGE DEFINITIONS ##########
+
+# STAGE 1. Training: configure parameters, run training steps, capture
+# metrics and persist artifacts,
+train:
+  # A. Params: the free-variables that control the training algo
+  parameters:
+    - name: "l2"
+      type: "float"
+      range: [0, 2]
+
+    - name: "eps"
+      type: "float"
+      range: "real"
+  
+  # B. Metrics: the measurables that quantify training success.
+  metrics:
+    - name: mse
+      source:
+        type: logs
+        regex: "mse=(.?)" # parse mse out of logs using this pattern
+    
+    # this metric comes from calls made to the polaris lib in the training
+    # code. No real need for this in the yaml, but it would act as an 'assert'
+    # that this metric comes in at training time.
+    - name: r2
+      source:
+        type: lib
+
+  # C. Config: things that control the training execution runtime.
+  # the env and hardware can be customized in each step.
+  runtime:
+    base_env: "python/python:3/8"
+    base_hardware: linux-vm-2xl
+  
+  # Configure the channel training features are pulled from. Any input to a step
+  # not generated as the output of a prior step should come from the feature source channel.
+  feature_channel: "train"
+
+  # This is the training pipeline. It is inspired by CircleCI (with some of the DAGyness stripped)
+  # Each step has inputs and outputs, a run block that specifies what to actually do (a la circle), 
+  # and block/s associated with saving artifacts. Clusters, env etc are specified in the run block.
+  steps:
+    - name: "train-basic-regression"
+      input:  "[region, age, known_price]"
+      run:
+        code: "train_basic.py"
+        code_function: "train"
+        hardware: onprem/gpu-1
+        environment: python/python:3.8
+          
+      artifacts:
+          # Save a
+        - name: "reg_model"
+          store:
+            name: "artifactory"
+            auth: SECRETS["ARTIFACTORY_KEY"]
+
+    - name: "train-neural-regression"
+      
+      # Run a special external HPO block.
+      input:  "[region, age, known_price]"
+      sagemaker_hyperparam_opt:
+        file: "train_nn.py"
+        train_function: "train"
+        trained_artifact: "model_artifacts/neural_reg_model.pkl"
+        optimization_target_metric: "r2"
+        optimization_strategy: "aws:bayesian"
+        param_grid:
+          - name: "l2"
+            values: "range(0, 3)"
+
+# STAGE 2. Testing
+testing:
+  feature_channel: "test"
+
+  # Option 1: Run testing code. An exit code > 0 is a failure.
+  # Polaris parses logs / XML output from all common testing libs.
+  steps:
+    - name: "run unit tests"
+      input:  "[region_onehot, age_normed, known_price]"
+      run:
+        shell: python -m unittest tests/test_model.py
+
+  # Option 2: Polaris-powered asserts on model quality. Great for quick and dirty testing.
+  # Uses metrics from training or metrics calculated by running inference on features
+  # in the supplied feature_channel.
+  metric_assertions:
+    - "{{metrics.regression.RMSE.delta}} > 0" # test using stored features for inputs and outputs
+    - "{{outcome_distro.95_percentile}} <= 157.5"
+    - "{{training_metrics.r2}} > 0.95" # test against training metrics
+
+
+# STAGE 3 (optional): customize the default model packaging
+# + storage of packaged models in external repo.
+package:
+  - docker_image:
+      base_image: slim/slimPy:3.8
+
+      external_registry:
+        url: "your.registry.ecr.aws.com/foo/bar"
+        auth: SECRETS["ECR_REGISTRY_KEY"]
+      
+      customize_dockerfile: |
+        RUN echo "foo bar"
+
+      hooks:
+        pre: 
+        post:
+  
+  - pip_package:
+      requirements: "requirements.txt"
+      external_registry: 
+        url: "your.internal-pip.com"
+        auth: SECRETS["PIP_REGISTRY_KEY"]
+
+
+
+
+# STAGE 4. Deploy creates the necessary runtime to run the models (or pushes a new model to an existing)
+# runtime if nothing has changes. The _specific_ deployment instance that is targeted depends on
+# the WORKSPACE set in the workflow. If a deployment with a matching name exists in the workspace,
+# it will be updated.
+deploy:
+  - name: "api-predictor"
+    type: http-api
+    route: /wine-price-prediction
+    runtime: 
+      type: k8s
+
+  - name: "batch-predictor"
+    type: batch
+    feature_channel: "batch-inference"
+
+    runtime: 
+      type: sagemaker-ford-2x
+      instance: m4.4xlarge
+  
+    trigger:
+      type:  "scheduled"
+      cron: "0 0 0 0 0 *"
+
+
+# STAGE 5 (optional): configures monitoring of the deployed model.
+monitor:
+  logging:
+    
+    # instruments runtime and/or capture stdout/stdin
+    execution_logs: 
+      - target: "datadog"
+        key: SECRETS["DATADOG_KEY"]
+        deployments: "*" # apply this to all deploys
+    
+    # log each set of model inputs and outputs
+    inference_logs:
+      - target: "arthur_ml"
+        arthur_model_id: ENV["ARTHUR_MODEL_ID"]
+        secret_key: SECRETS["ARTHUR_KEY"]
+        deployments: "api-predictor"
+  
+  data_drift:
+    metrics:
+      - kldivergence
+      - population_stability_index

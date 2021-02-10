@@ -1,0 +1,44 @@
+data_sources:
+  - name: "training-data"
+    type: "s3" # PLUGIN: data sources
+    bucket: s3://us-west-2/wine-data-store
+    file_type: "columnar.csv"
+    filter: "2020/*/*/train_*.csv" # collate all train CSVs in the 2020 folder.
+  
+  - name: "test-data"
+    type: "s3"
+    bucket: s3://us-west-2/wine-data-store
+    filter: "2020/*/*/test_*.csv" # collate all test CSVs in the 2020 folder.
+
+  - name: "inference-data"
+    type: "s3"
+    bucket: s3://us-west-2/wine-live-data
+    filter: "2020/*/*/batch_*.csv" # collate all batch CSVs in the 2020 folder.
+
+# create named features - each with a type, and split into different channels.
+# channels let you supply stages with the same features but from different sources
+# to support training, testing, and inference.
+features:
+  - age:
+      type: "float"
+      transform:
+        python: |
+          def transform(age_string):
+            np.round(np.float(age_string))
+      channels: 
+        - training: training-data.age
+        - test: test-data.age
+        - batch-inference: batch-inference-data.age
+  
+  - region:
+      type: "string"
+      channels:
+        - training: training-data.region
+        - test: test-data.region
+        - batch-inference: batch-inference-data.region
+
+  - known_price:
+      type: "float"
+      channels:
+        - training: training-data.known_price
+        - test: test-data.known_price
